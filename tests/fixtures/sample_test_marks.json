@@ -1,0 +1,34 @@
+[
+  {
+    "subject": "Mathematics",
+    "topic": "Linear Equations",
+    "total_marks": 25.0,
+    "scored_marks": 17.5,
+    "mistake_types": ["Calculation / careless error", "Misread the question"],
+    "notes": "Sign error when moving negative terms across equality sign in Q3."
+  },
+  {
+    "subject": "Mathematics",
+    "topic": "Linear Equations",
+    "total_marks": 25.0,
+    "scored_marks": 23.0,
+    "mistake_types": ["Calculation / careless error"],
+    "notes": "Retest attempt after practice; only made a small addition slip."
+  },
+  {
+    "subject": "Physics",
+    "topic": "Newtonian Mechanics",
+    "total_marks": 30.0,
+    "scored_marks": 18.0,
+    "mistake_types": ["Conceptual misunderstanding", "Forgot formula or fact"],
+    "notes": "Confused friction coefficient formula with normal reaction force."
+  },
+  {
+    "subject": "Chemistry",
+    "topic": "Stoichiometry",
+    "total_marks": 20.0,
+    "scored_marks": 8.0,
+    "mistake_types": [],
+    "notes": "Low score without specific mistake tags to test fallback recommendation."
+  }
+]

@@ -1,0 +1,17 @@
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+bloom.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.bak
+.pytest_cache/
+data/uploads/
+data/
+backups/
