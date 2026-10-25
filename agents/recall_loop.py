@@ -6,17 +6,25 @@ from core.db import (
 )
 from core.learning import next_review_days
 
-def generate_recall_prompt(gemini, subject, topic, stage=None):
+def generate_recall_prompt(gemini, subject, topic, stage=None, curriculum=None, curriculum_context=None, custom_syllabus=""):
     """
     Generate an active retrieval challenge requiring the student to retrieve
     knowledge from memory without seeing multiple-choice options or answers first.
+    Calibrates depth and terminology to the student's educational stage and curriculum.
     """
     topic_str = (topic or "General Topic").strip()
     subj_str = (subject or "General").strip()
 
+    from core.syllabus import build_curriculum_context
+    ctx = curriculum_context or build_curriculum_context(stage, curriculum, subj_str, topic_str, custom_syllabus=custom_syllabus)
+
     if gemini and getattr(gemini, "available", lambda: False)():
-        prompt = f"""Create an active retrieval challenge for a student on the topic '{topic_str}' in '{subj_str}'.
+        prompt = f"""You are an educational assistant creating an active recall challenge.
+{ctx}
+
+Create an active retrieval challenge for a student on the topic '{topic_str}' in '{subj_str}'.
 The goal is ACTIVE RECALL (testing knowledge from memory without showing answers).
+Align terminology, depth, and rigour with the student's academic profile above.
 
 Return a valid JSON object with:
 - "challenge": A specific, high-yield retrieval prompt asking the student to explain the core concept, state key formulas/laws, and describe a real application or mechanism from memory.
@@ -28,9 +36,22 @@ Format response as strictly valid JSON."""
         raw, status = gemini.generate_text(prompt, max_output_tokens=1400)
         if raw:
             try:
-                match = re.search(r"\{.*\}", raw, re.DOTALL)
-                data = json.loads(match.group(0) if match else raw)
-                if "challenge" in data and "model_answer" in data:
+                clean = raw.strip()
+                fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean, re.DOTALL | re.IGNORECASE)
+                cand_str = fence_match.group(1) if fence_match else clean
+
+                start_brace = cand_str.find("{")
+                end_brace = cand_str.rfind("}")
+                if start_brace != -1 and end_brace > start_brace:
+                    cand_str = cand_str[start_brace:end_brace + 1]
+
+                from agents.gap_finder import _sanitize_json_escapes
+                try:
+                    data = json.loads(cand_str, strict=False)
+                except Exception:
+                    data = json.loads(_sanitize_json_escapes(cand_str), strict=False)
+
+                if isinstance(data, dict) and "challenge" in data and "model_answer" in data:
                     return {
                         "challenge": str(data["challenge"]).strip(),
                         "model_answer": str(data["model_answer"]).strip(),

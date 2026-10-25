@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import re
 import hashlib
-from datetime import date
+from datetime import date, datetime
 
 from core.db import (
     init_db, get_or_create_student, get_dashboard_data, get_due_reviews,
@@ -14,7 +15,8 @@ from core.db import (
     delete_textbook_session, save_textbook_qa, get_textbook_qa,
     migrate_legacy_student, connect,
     create_user_account, get_student_by_username, get_student_by_id, get_student_by_owner_id,
-    save_important_concept, get_saved_concepts, get_saved_concept_count, delete_saved_concept
+    save_important_concept, get_saved_concepts, get_saved_concept_count, delete_saved_concept,
+    format_local_timestamp
 )
 from core.auth import (
     get_current_user, login_local, logout_user, is_oidc_configured,
@@ -35,7 +37,10 @@ from services.pdf_service import (
     MAX_TEXTBOOK_WORDS, count_words, enforce_word_limit, search_text_by_keywords
 )
 from core.learning import build_practice_set, calculate_score
-from core.syllabus import get_supported_curricula, get_syllabus_context
+from core.syllabus import get_supported_curricula, get_syllabus_context, build_curriculum_context
+from services.study_guide_service import (
+    get_available_guide_concepts, generate_single_concept_guide, create_study_guide_pdf
+)
 
 # ---------------------------------------------------------
 # PAGE SETUP & BRAND IDENTITY
@@ -84,6 +89,11 @@ html, body, [class*="css"] {
     background: rgba(15, 22, 18, 0.85) !important;
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border);
+    pointer-events: none !important;
+}
+
+[data-testid="stHeader"] > * {
+    pointer-events: auto !important;
 }
 
 /* Hide Streamlit Deploy button cleanly without hiding toolbar or sidebar toggle */
@@ -309,8 +319,10 @@ div[data-baseweb="select"]:focus-within > div {
 }
 
 /* Dropdown Menu Portal Popover (Open State) */
-div[data-baseweb="popover"],
-div[data-baseweb="popover"] > div,
+div[data-baseweb="popover"] {
+    pointer-events: auto !important;
+}
+
 div[data-baseweb="menu"],
 ul[role="listbox"] {
     background: #16221b !important;
@@ -336,17 +348,23 @@ div[data-baseweb="option"][aria-selected="true"] {
     font-weight: 600 !important;
 }
 
-/* Multiselect Chips / Tags (No bright red!) */
+/* Multiselect Chips / Tags (No bright red, wrap gracefully within bounds) */
 [data-baseweb="tag"] {
     background: #1c3829 !important;
     border: 1px solid #365e44 !important;
     border-radius: 8px !important;
     padding: 2px 8px !important;
+    max-width: 100% !important;
+    white-space: normal !important;
+    word-break: break-word !important;
 }
 
 [data-baseweb="tag"] span {
     color: #a3e7b7 !important;
     font-weight: 600 !important;
+    white-space: normal !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
 }
 
 [data-baseweb="tag"] svg,
@@ -560,8 +578,17 @@ NAV_PAGES = [
     "Marks analysis",
     "Recall & revision",
     "Textbook helper",
+    "Personal study guide",
     "My progress"
 ]
+
+# Standard configuration to keep summary charts readable and stationary without pan/zoom
+CHART_CONFIG = {
+    "displayModeBar": False,
+    "scrollZoom": False,
+    "showAxisDragHandles": False,
+    "staticPlot": False  # Preserves rich hover tooltips
+}
 
 if "nav_page" not in st.session_state:
     st.session_state["nav_page"] = "Overview"
@@ -592,9 +619,9 @@ if not auth_user.get("authenticated"):
     </div>
     """, unsafe_allow_html=True)
 
-    sign_col1, sign_col2 = st.columns([1.2, 1])
+    sign_c_left, sign_col, sign_c_right = st.columns([1, 2.4, 1])
 
-    with sign_col1:
+    with sign_col:
         st.markdown("### Access Your Learning Space")
 
         if is_oidc_configured():
@@ -604,7 +631,7 @@ if not auth_user.get("authenticated"):
                 <div class="small-muted">Log in using your verified OpenID Connect account.</div>
             </div>
             """, unsafe_allow_html=True)
-            if st.button("Sign in with Google / OIDC 🔑", type="primary", use_container_width=True):
+            if st.button("Sign in with Google / OIDC 🔑", type="primary", width="stretch"):
                 st.login("google")
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
@@ -615,7 +642,7 @@ if not auth_user.get("authenticated"):
                 st.markdown("#### Log In to Existing Account")
                 l_user = st.text_input("Username", placeholder="e.g. rutuja", max_chars=40, key="login_username_input")
                 l_pass = st.text_input("Password", type="password", placeholder="Enter your password", key="login_password_input")
-                submit_login = st.form_submit_button("Log In 🔑", type="primary", use_container_width=True)
+                submit_login = st.form_submit_button("Log In 🔑", type="primary", width="stretch")
 
                 if submit_login:
                     clean_u = l_user.strip()
@@ -643,7 +670,7 @@ if not auth_user.get("authenticated"):
                 r_name = st.text_input("Display Name", placeholder="e.g. Rutuja", max_chars=40, key="reg_display_input")
                 r_stage = st.selectbox("Stage / Grade", ["Class 10", "Class 12", "College", "Research / PhD"], index=2, key="reg_stage_input")
                 r_email = st.text_input("Email (Optional)", placeholder="e.g. rutuja@example.edu", max_chars=80, key="reg_email_input")
-                submit_reg = st.form_submit_button("Create Account ✨", type="primary", use_container_width=True)
+                submit_reg = st.form_submit_button("Create Account ✨", type="primary", width="stretch")
 
                 if submit_reg:
                     clean_ru = r_user.strip()
@@ -672,25 +699,6 @@ if not auth_user.get("authenticated"):
                             import logging
                             logging.error(f"Account creation failure: {exc}")
                             st.error("Unable to create account at this time. Please try again.")
-
-    with sign_col2:
-        st.markdown("### 🔒 Student Data Privacy & Isolation")
-        st.markdown("""
-        <div class="panel">
-            <h4 style="margin:0 0 0.4rem 0;color:#eaf3ed">Private & Isolated Learning Records</h4>
-            <p class="small-muted" style="margin-bottom:0.6rem">
-                Every learning record in Bloom is strictly isolated to your authenticated account ID:
-            </p>
-            <ul class="small-muted" style="padding-left:1.2rem;margin:0 0 0.8rem 0">
-                <li><b>Grounded Mastery:</b> Diagnostic results and mistake patterns are private to your account.</li>
-                <li><b>Textbook Sessions:</b> Uploaded PDFs, Q&A history, and My 4 Important Concepts are private to you.</li>
-                <li><b>Spaced Revision:</b> Recall intervals adapt exclusively to your personal memory decay.</li>
-            </ul>
-            <p class="small-muted" style="margin:0">
-                Multiple students can share the same display name. Accounts are securely isolated by unique username and stable internal account ID.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
 
     st.stop()
 
@@ -743,7 +751,6 @@ with st.sidebar:
             <span style="font-size:0.75rem;color:#a3e7b7;background:#182e22;padding:2px 6px;border-radius:4px">{student_rec['grade']}</span>
         </div>
         <div style="font-size:0.76rem;color:#a3e7b7;margin-top:3px">@{student_rec.get('username', 'learner')}</div>
-        <div style="font-size:0.72rem;color:#8fa697;margin-top:2px;word-break:break-all">ID: {student_rec['owner_id'][:20]}...</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -756,9 +763,13 @@ with st.sidebar:
             index=grade_options.index(student_rec["grade"]) if student_rec["grade"] in grade_options else 2,
             key="edit_profile_grade"
         )
-        if st.button("Save Profile Changes", key="save_profile_btn", use_container_width=True):
+        if st.button("Save Profile Changes", key="save_profile_btn", width="stretch"):
             if new_name.strip():
-                update_student_profile(student_id, auth_user["owner_id"], display_name=new_name.strip(), grade=new_grade)
+                new_curr = None
+                if new_grade != student_rec["grade"]:
+                    new_curr = get_supported_curricula(new_grade)[0]
+                    st.session_state["curriculum"] = new_curr
+                update_student_profile(student_id, auth_user["owner_id"], display_name=new_name.strip(), grade=new_grade, curriculum=new_curr)
                 st.session_state["student_name"] = new_name.strip()
                 st.session_state["grade"] = new_grade
                 st.success("Profile updated.")
@@ -781,15 +792,37 @@ with st.sidebar:
         except Exception:
             pass
 
-    curricula_list = get_supported_curricula()
+    curricula_list = get_supported_curricula(current_grade)
+    saved_curr = st.session_state.get("curriculum") or student_rec.get("curriculum")
+    curr_index = 0
+    if saved_curr in curricula_list:
+        curr_index = curricula_list.index(saved_curr)
+    else:
+        # Gracefully handle missing or contradictory curriculum
+        saved_curr = curricula_list[0]
+        curr_index = 0
+
     current_curriculum = st.selectbox(
-        "Curriculum / Board",
+        "Curriculum / Syllabus",
         curricula_list,
-        index=st.session_state.get("curriculum_index", 0),
-        help="Select your educational board to ground question generation in verified syllabi."
+        index=curr_index,
+        help=f"Select your academic syllabus framework (calibrated for {current_grade})."
     )
-    st.session_state["curriculum_index"] = curricula_list.index(current_curriculum)
+    custom_board = ""
+    if current_curriculum == "Custom Syllabus (Learner-Supplied)":
+        custom_board = st.text_input(
+            "Specify University / Board / Outline",
+            value=st.session_state.get("custom_board_text", ""),
+            placeholder="e.g. SPPU, Anna Univ, VTU, Autonomous",
+            key="custom_board_text"
+        )
+        if custom_board.strip():
+            current_curriculum = f"{custom_board.strip()} (Custom Syllabus)"
+
+    st.session_state["curriculum_index"] = curr_index
     st.session_state["curriculum"] = current_curriculum
+    if current_curriculum != student_rec.get("curriculum"):
+        update_student_profile(student_id, auth_user["owner_id"], curriculum=current_curriculum)
 
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
@@ -804,11 +837,11 @@ with st.sidebar:
 
     st.divider()
 
-    if st.button("Sign Out 🚪", use_container_width=True):
+    if st.button("Sign Out 🚪", width="stretch"):
         logout_user()
         st.rerun()
 
-    if st.button("Refresh Workspace", use_container_width=True):
+    if st.button("Refresh Workspace", width="stretch"):
         st.rerun()
 
 gemini = GeminiService()
@@ -886,7 +919,7 @@ if page == "Overview":
         st.button(
             "Start Diagnostic Assessment",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=set_nav_page,
             args=("Find my gaps",)
         )
@@ -956,7 +989,8 @@ if page == "Overview":
                         tickfont=dict(color="#b5cbbb", size=11)
                     )
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                fig.update_layout(dragmode=False)
+                st.plotly_chart(fig, width="stretch", config=CHART_CONFIG)
             else:
                 st.markdown("""
                 <div class="panel">
@@ -1024,19 +1058,19 @@ elif page == "Find my gaps":
             if syl_ctx.get("verified"):
                 st.markdown(f"""
                 <div style="background:#132219;border:1px solid #285438;border-radius:8px;padding:6px 10px;margin-bottom:8px">
-                    <span style="color:#a3e7b7;font-weight:600;font-size:0.8rem">📘 VERIFIED SYLLABUS:</span>
-                    <span style="color:#eaf3ed;font-size:0.8rem">Questions are grounded in official verified syllabus: {syl_ctx['curriculum']} · Unit: {syl_ctx.get('chapters') or syl_ctx.get('unit')}</span>
+                    <span style="color:#a3e7b7;font-weight:600;font-size:0.8rem">📘 REFERENCE SYLLABUS:</span>
+                    <span style="color:#eaf3ed;font-size:0.8rem">Questions are aligned with reference syllabus: {syl_ctx['curriculum']} · Unit: {syl_ctx.get('chapters') or syl_ctx.get('unit')}</span>
                 </div>
                 """, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
                 <div style="background:#1c241e;border:1px solid #2f3e34;border-radius:8px;padding:6px 10px;margin-bottom:8px">
-                    <span style="color:#9ab1a3;font-weight:600;font-size:0.8rem">ℹ️ TOPIC SCOPE:</span>
-                    <span style="color:#d2e4d8;font-size:0.8rem">Questions are generated from the selected topic and are not verified against a specific syllabus.</span>
+                    <span style="color:#9ab1a3;font-weight:600;font-size:0.8rem">ℹ️ CURRICULUM CONTEXT:</span>
+                    <span style="color:#d2e4d8;font-size:0.8rem">{current_curriculum} · Questions are calibrated for {current_grade} level core academic principles.</span>
                 </div>
                 """, unsafe_allow_html=True)
 
-        if st.button("Generate Diagnostic Assessment", type="primary", use_container_width=True):
+        if st.button("Generate Diagnostic Assessment", type="primary", width="stretch"):
             if not clean_topic:
                 st.warning("Please enter a topic name before starting.")
             else:
@@ -1050,7 +1084,8 @@ elif page == "Find my gaps":
                         count=count,
                         stage=current_grade,
                         curriculum=current_curriculum,
-                        previous_questions=prev_qs
+                        previous_questions=prev_qs,
+                        custom_syllabus=st.session_state.get("custom_board_text", "")
                     )
 
                 st.session_state["diagnostic"] = {
@@ -1102,10 +1137,20 @@ elif page == "Find my gaps":
         st.divider()
         if not diagnostic.get("questions"):
             friendly_err = diagnostic.get("source") or "We couldn't prepare verified questions for this topic right now. Please try again."
-            st.warning(f"⚠️ {friendly_err}")
-            if st.button("🔄 Try Again", key="retry_diag_btn"):
-                st.session_state.pop("diagnostic", None)
-                st.rerun()
+            st.error(f"⚠️ **Diagnostic Assessment Notice**\n\n{friendly_err}")
+            col_retry, col_edit = st.columns([1, 1])
+            with col_retry:
+                if st.button("🔄 Try Again", key="retry_diag_btn", width="stretch"):
+                    if diagnostic.get("topic"):
+                        st.session_state["gap_topic"] = diagnostic["topic"]
+                    st.session_state.pop("diagnostic", None)
+                    st.rerun()
+            with col_edit:
+                if st.button("✏️ Modify Topic", key="edit_diag_topic_btn", width="stretch"):
+                    if diagnostic.get("topic"):
+                        st.session_state["gap_topic"] = diagnostic["topic"]
+                    st.session_state.pop("diagnostic", None)
+                    st.rerun()
         else:
             st.markdown(f"### Diagnostic: {diagnostic['topic']}")
             st.caption(f"Subject: {diagnostic['subject']} · Status: {diagnostic['source']}")
@@ -1127,7 +1172,7 @@ elif page == "Find my gaps":
                             st.write(q["hint"])
                     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
-                submitted = st.form_submit_button("Submit Diagnostic", type="primary", use_container_width=True)
+                submitted = st.form_submit_button("Submit Diagnostic", type="primary", width="stretch")
 
             if submitted:
                 if st.session_state.get("diagnostic_submitted"):
@@ -1140,56 +1185,56 @@ elif page == "Find my gaps":
                     else:
                         st.session_state["diagnostic_submitted"] = True
                         results = []
-                for q in diagnostic["questions"]:
-                    ans = answers.get(q["id"], "")
-                    is_correct = (str(ans).strip().lower() == str(q["answer"]).strip().lower())
-                    results.append({
-                        "question": q,
-                        "answer": ans,
-                        "correct": is_correct
-                    })
-                    save_attempt(
-                        student_id,
-                        diagnostic["subject"],
-                        diagnostic["topic"],
-                        q["prompt"],
-                        ans,
-                        q["answer"],
-                        is_correct,
-                        q.get("mistake_type", "conceptual"),
-                        mode="diagnostic"
-                    )
+                        for q in diagnostic["questions"]:
+                            ans = answers.get(q["id"], "")
+                            is_correct = (str(ans).strip().lower() == str(q["answer"]).strip().lower())
+                            results.append({
+                                "question": q,
+                                "answer": ans,
+                                "correct": is_correct
+                            })
+                            save_attempt(
+                                student_id,
+                                diagnostic["subject"],
+                                diagnostic["topic"],
+                                q["prompt"],
+                                ans,
+                                q["answer"],
+                                is_correct,
+                                q.get("mistake_type", "conceptual"),
+                                mode="diagnostic"
+                            )
 
-                score = calculate_score(results)
-                analysis = analyze_test(gemini, results, diagnostic["subject"], diagnostic["topic"])
+                        score = calculate_score(results)
+                        analysis = analyze_test(gemini, results, diagnostic["subject"], diagnostic["topic"])
 
-                # Update mastery for each mistake pattern
-                for mistake in analysis.get("mistakes", []):
-                    update_mastery(
-                        student_id,
-                        diagnostic["subject"],
-                        diagnostic["topic"],
-                        mistake["type"],
-                        mistake["count"],
-                        score
-                    )
+                        # Update mastery for each mistake pattern
+                        for mistake in analysis.get("mistakes", []):
+                            update_mastery(
+                                student_id,
+                                diagnostic["subject"],
+                                diagnostic["topic"],
+                                mistake["type"],
+                                mistake["count"],
+                                score
+                            )
 
-                # Schedule spaced revision (1 day if score < 60, otherwise 3 days)
-                review_days = 1 if score < 60 else 3
-                add_review(
-                    student_id,
-                    diagnostic["subject"],
-                    diagnostic["topic"],
-                    days=review_days,
-                    reason=f"Diagnostic result: {score}%"
-                )
+                        # Schedule spaced revision (1 day if score < 60, otherwise 3 days)
+                        review_days = 1 if score < 60 else 3
+                        add_review(
+                            student_id,
+                            diagnostic["subject"],
+                            diagnostic["topic"],
+                            days=review_days,
+                            reason=f"Diagnostic result: {score}%"
+                        )
 
-                st.session_state["diagnostic_result"] = {
-                    "results": results,
-                    "score": score,
-                    "analysis": analysis
-                }
-                st.rerun()
+                        st.session_state["diagnostic_result"] = {
+                            "results": results,
+                            "score": score,
+                            "analysis": analysis
+                        }
+                        st.rerun()
 
     result = st.session_state.get("diagnostic_result")
 
@@ -1221,7 +1266,10 @@ elif page == "Find my gaps":
                     diagnostic["subject"],
                     diagnostic["topic"],
                     result["analysis"],
-                    gemini=gemini
+                    gemini=gemini,
+                    stage=current_grade,
+                    curriculum=current_curriculum,
+                    custom_syllabus=st.session_state.get("custom_board_text", "")
                 )
             st.session_state["practice_meta"] = {
                 "subject": diagnostic["subject"],
@@ -1319,7 +1367,7 @@ elif page == "Marks analysis":
         selected_types = st.multiselect("Select all that apply:", all_mistake_types, default=["Conceptual misunderstanding"])
         notes = st.text_area("Optional: Describe an example question where you lost marks", placeholder="e.g. Formula was correct but applied incorrect boundary condition.")
 
-        submitted = st.form_submit_button("Analyze Test Marks", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Analyze Test Marks", type="primary", width="stretch")
 
     if submitted:
         if scored_marks > total_marks:
@@ -1470,7 +1518,7 @@ elif page == "Recall & revision":
 
                 col_sub, col_cancel = st.columns([1, 4])
                 with col_sub:
-                    if st.button("Submit Retrieval", type="primary", use_container_width=True):
+                    if st.button("Submit Retrieval", type="primary", width="stretch"):
                         if not student_recall_input.strip():
                             st.warning("Please type your response from memory before submitting.")
                         else:
@@ -1519,7 +1567,7 @@ elif page == "Recall & revision":
                     key="eval_radio"
                 )
 
-                if st.button("Save & Reschedule Review", type="primary", use_container_width=True):
+                if st.button("Save & Reschedule Review", type="primary", width="stretch"):
                     res = complete_recall_session(
                         student_id=student_id,
                         review_id=rev_data.get("id"),
@@ -1550,9 +1598,16 @@ elif page == "Recall & revision":
                             st.markdown(f"**{rev['topic']}**")
                             st.caption(f"{rev['subject']} · Due: **{rev['due_date']}** · {rev['reason']}")
                         with c2:
-                            if st.button("Start Active Recall 🧠", key=f"start_recall_{rev['id']}", use_container_width=True, type="primary"):
+                            if st.button("Start Active Recall 🧠", key=f"start_recall_{rev['id']}", width="stretch", type="primary"):
                                 with st.spinner("Preparing active recall challenge..."):
-                                    challenge = generate_recall_prompt(gemini, rev["subject"], rev["topic"], stage=current_grade)
+                                    challenge = generate_recall_prompt(
+                                        gemini,
+                                        rev["subject"],
+                                        rev["topic"],
+                                        stage=current_grade,
+                                        curriculum=current_curriculum,
+                                        custom_syllabus=st.session_state.get("custom_board_text", "")
+                                    )
                                 st.session_state["active_recall"] = {
                                     "review": rev,
                                     "challenge": challenge,
@@ -1560,7 +1615,7 @@ elif page == "Recall & revision":
                                 }
                                 st.rerun()
                         with c3:
-                            if st.button("Mark Mastered", key=f"mast_{rev['id']}", use_container_width=True):
+                            if st.button("Mark Mastered", key=f"mast_{rev['id']}", width="stretch"):
                                 res = complete_review(student_id, rev["id"], rev["subject"], rev["topic"], mastered=True)
                                 st.success(res["message"])
                                 st.rerun()
@@ -1609,7 +1664,7 @@ elif page == "Recall & revision":
                 <div class="panel" style="padding:0.8rem 1.1rem;margin-bottom:0.6rem">
                     <div style="display:flex;justify-content:space-between">
                         <span style="font-weight:600;color:#eaf3ed">{s['topic']} ({s['subject']})</span>
-                        <span style="color:#a3e7b7;font-size:0.82rem">{s['created_at']}</span>
+                        <span style="color:#a3e7b7;font-size:0.82rem">{format_local_timestamp(s.get('created_at'))}</span>
                     </div>
                     <div style="margin:4px 0;font-size:0.88rem;color:#d2e4d8"><b>Self-Assessment:</b> {eval_tag}</div>
                     <div style="font-size:0.83rem;color:#9ab1a3;white-space:pre-wrap;background:#131c16;padding:6px 10px;border-radius:6px;margin-top:4px">{s.get('response', '')[:250]}{'...' if len(s.get('response', '')) > 250 else ''}</div>
@@ -1693,7 +1748,7 @@ elif page == "Textbook helper":
                     {f'<div style="color:#9ab1a3;font-size:0.83rem;font-style:italic">Note: {sc["notes"]}</div>' if sc.get('notes') else ''}
                 </div>
                 """, unsafe_allow_html=True)
-                if st.button("Delete Concept 🗑️", key=f"del_concept_btn_{sc['id']}", use_container_width=True):
+                if st.button("Delete Concept 🗑️", key=f"del_concept_btn_{sc['id']}", width="stretch"):
                     delete_saved_concept(student_id, sc["id"])
                     st.success(f"Deleted '{sc['concept_name']}'. You can now save a replacement concept.")
                     st.rerun()
@@ -1732,8 +1787,8 @@ elif page == "Textbook helper":
 
     # 1. Study Sessions Management
     saved_sessions = get_textbook_sessions(student_id)
-    session_options = ["➕ Create New Study Session"] + [f"{s['title']} ({s['created_at'][:10]} · #{s['id']})" for s in saved_sessions]
-    session_map = {f"{s['title']} ({s['created_at'][:10]} · #{s['id']})": s for s in saved_sessions}
+    session_options = ["➕ Create New Study Session"] + [f"{s['title']} ({format_local_timestamp(s.get('created_at'), '%Y-%m-%d')} · #{s['id']})" for s in saved_sessions]
+    session_map = {f"{s['title']} ({format_local_timestamp(s.get('created_at'), '%Y-%m-%d')} · #{s['id']})": s for s in saved_sessions}
 
     # Determine default selected session
     selected_idx = 0
@@ -1793,7 +1848,7 @@ elif page == "Textbook helper":
                         if is_truncated:
                             st.warning(f"⚠️ Truncation Notice: Accepting the first {MAX_TEXTBOOK_WORDS:,} words out of {total_words:,} total extracted words.")
 
-                        if st.button("Save & Start Study Session", type="primary", use_container_width=True):
+                        if st.button("Save & Start Study Session", type="primary", width="stretch"):
                             title_to_save = session_title.strip() or uploaded.name
                             # Save PDF to private persistent directory
                             rel_storage_path = save_uploaded_pdf(student_id, uploaded.name, file_bytes)
@@ -1830,7 +1885,7 @@ elif page == "Textbook helper":
                 if is_truncated:
                     st.warning(f"⚠️ Content Truncated: Accepting the first {MAX_TEXTBOOK_WORDS:,} words out of {total_words:,} pasted words.")
 
-                if st.button("Save & Start Study Session", type="primary", use_container_width=True):
+                if st.button("Save & Start Study Session", type="primary", width="stretch"):
                     title_to_save = session_title.strip() or (pasted_text.strip().splitlines()[0][:40] if pasted_text.strip() else "Lesson Notes")
                     new_id = save_textbook_session(
                         student_id=student_id,
@@ -1852,8 +1907,24 @@ elif page == "Textbook helper":
 
     else:
         # Existing Session is Selected
-        cur_session = session_map[selected_session_label]
+        cur_summary = session_map[selected_session_label]
+        full_session = get_textbook_session(student_id, cur_summary["id"])
+        cur_session = full_session if full_session else cur_summary
         st.session_state["active_tb_session_id"] = cur_session["id"]
+
+        # Defensive text extraction handling
+        session_text = cur_session.get("extracted_text") or ""
+        if not session_text.strip() and cur_session.get("source_type") == "pdf" and cur_session.get("storage_path"):
+            from pathlib import Path
+            pdf_path = Path(cur_session["storage_path"])
+            if pdf_path.exists():
+                try:
+                    re_extracted, _ = extract_pdf_text(pdf_path.read_bytes())
+                    if re_extracted.strip():
+                        session_text = re_extracted
+                except Exception:
+                    pass
+        cur_session["extracted_text"] = session_text
 
         # Session Header & Metadata
         c_meta1, c_meta2 = st.columns([3, 1])
@@ -1862,7 +1933,7 @@ elif page == "Textbook helper":
             st.caption(
                 f"Source: **{cur_session['source_name']}** ({cur_session['source_type'].upper()}) · "
                 f"Words: **{cur_session['accepted_words']:,}** · "
-                f"Created: {cur_session['created_at'][:16]}"
+                f"Created: {format_local_timestamp(cur_session.get('created_at'))}"
             )
             if cur_session.get("is_truncated"):
                 st.warning(f"⚠️ Truncation Notice: Bloom accepted the first {cur_session['accepted_words']:,} words of this document.")
@@ -1897,7 +1968,7 @@ elif page == "Textbook helper":
                 <div class="panel" style="padding:1rem 1.2rem;margin-bottom:0.9rem">
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
                         <span style="font-weight:700;color:#eaf3ed;font-size:1.02rem">Q{idx}: {qa['question']}</span>
-                        <span style="font-size:0.75rem;color:#a3e7b7;background:#182e22;padding:2px 8px;border-radius:4px">{mode_label} · {qa['created_at'][:16]}</span>
+                        <span style="font-size:0.75rem;color:#a3e7b7;background:#182e22;padding:2px 8px;border-radius:4px">{mode_label} · {format_local_timestamp(qa.get('created_at'))}</span>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1932,24 +2003,34 @@ elif page == "Textbook helper":
         question_input = st.text_area(
             "Enter your question:",
             placeholder="e.g. Explain how ATP synthase produces energy based on this text...",
-            key=f"tb_q_input_{cur_session['id']}"
+            key=f"tb_q_input_{cur_session['id']}",
+            help="Enter inserts a newline. Press Ctrl+Enter or use the buttons below to submit."
         )
+        st.caption("💡 Enter inserts a newline. Press Ctrl+Enter or click below to submit.")
 
         col_ai, col_kw = st.columns([1, 1])
         ai_available = gemini.available()
 
         with col_ai:
-            if st.button("Explain with AI 🤖", type="primary", use_container_width=True, key=f"btn_ai_{cur_session['id']}"):
+            if st.button("Explain with AI 🤖", type="primary", width="stretch", key=f"btn_ai_{cur_session['id']}"):
                 clean_q = question_input.strip()
                 placeholder_guidance = "e.g. explain how atp synthase produces energy based on this text..."
                 if not clean_q or clean_q.lower() == placeholder_guidance:
                     st.warning("Please enter your own question. The placeholder example is guidance only.")
+                elif not session_text.strip():
+                    st.info("No study text is available in this session to answer questions from.")
                 elif not ai_available:
                     st.info("AI assistance is temporarily unavailable. You can continue using keyword search below or try again in a few moments.")
                 else:
-                    relevant_section = find_relevant_context(cur_session["extracted_text"], clean_q, max_chars=18000)
+                    relevant_section = find_relevant_context(session_text, clean_q, max_chars=18000)
                     with st.spinner("Analyzing source material with Bloom AI..."):
-                        ans, status = gemini.explain_from_document(clean_q, relevant_section)
+                        curr_ctx = build_curriculum_context(
+                            current_grade,
+                            current_curriculum,
+                            topic=clean_q,
+                            custom_syllabus=st.session_state.get("custom_board_text", "")
+                        )
+                        ans, status = gemini.explain_from_document(clean_q, relevant_section, curriculum_context=curr_ctx)
 
                     # Save only successful responses
                     if ans and "Bloom couldn't generate" not in ans:
@@ -1968,13 +2049,15 @@ elif page == "Textbook helper":
                         st.info("AI assistance is temporarily unavailable. You can continue using keyword search or try again in a few moments.")
 
         with col_kw:
-            if st.button("Search by Keywords (Non-AI Mode) 🔍", use_container_width=True, key=f"btn_kw_{cur_session['id']}"):
+            if st.button("Search by Keywords (Non-AI Mode) 🔍", width="stretch", key=f"btn_kw_{cur_session['id']}"):
                 clean_q = question_input.strip()
                 placeholder_guidance = "e.g. explain how atp synthase produces energy based on this text..."
                 if not clean_q or clean_q.lower() == placeholder_guidance:
                     st.warning("Please enter search keywords or a question. The placeholder example is guidance only.")
+                elif not session_text.strip():
+                    st.info("No study text is available in this session to search.")
                 else:
-                    results = search_text_by_keywords(cur_session["extracted_text"], clean_q, max_results=5)
+                    results = search_text_by_keywords(session_text, clean_q, max_results=5)
                     if results:
                         st.markdown("### 🔍 Relevant Excerpts (Non-AI Keyword Match)")
                         for i, r in enumerate(results, 1):
@@ -1994,10 +2077,242 @@ elif page == "Textbook helper":
             st.info("💡 **AI Explanations Offline:** AI assistance is currently unavailable. You can review saved Q&A above, search by keywords, or read the source material.")
 
         with st.expander("Preview Accepted Source Material", expanded=False):
-            st.text(cur_session["extracted_text"][:6000] + ("..." if len(cur_session["extracted_text"]) > 6000 else ""))
+            if session_text.strip():
+                st.text(session_text[:6000] + ("..." if len(session_text) > 6000 else ""))
+            else:
+                st.info("No study text content is recorded for this session.")
 
 # ---------------------------------------------------------
-# SECTION 6: MY PROGRESS
+# SECTION 6: PERSONAL STUDY GUIDE
+# ---------------------------------------------------------
+
+elif page == "Personal study guide":
+    render_hero(
+        "Your Personal Study Guide",
+        "Compile your recorded gaps, saved textbook concepts, and active recall topics into a personalized, downloadable study guide PDF.",
+        "REVISION & MASTERY"
+    )
+
+    st.markdown("### 📚 Select Concepts & Topics for Your Guide")
+    st.caption("Bloom combines your stored diagnostic error patterns, saved textbook notes, and revision queue into a structured academic guide.")
+
+    # 1. Retrieve available recorded concepts
+    available_concepts = get_available_guide_concepts(student_id)
+
+    # 2. Add custom concepts container
+    if "psg_custom_list" not in st.session_state:
+        st.session_state["psg_custom_list"] = []
+
+    with st.expander("➕ Add Custom Topics / Concepts Manually", expanded=(len(available_concepts) == 0)):
+        st.markdown("Add any specific topic or course concept you want to study even if you haven't taken a diagnostic test yet:")
+        c_col1, c_col2 = st.columns([2.5, 1.5])
+        with c_col1:
+            manual_topic = st.text_input("Concept / Topic Name:", placeholder="e.g. Graph Neural Networks, Photosynthesis, Thermodynamics", key="psg_manual_topic_input")
+        with c_col2:
+            manual_subj = st.text_input("Subject / Course (Optional):", placeholder="e.g. Computer Science, Biology", key="psg_manual_subj_input")
+
+        if st.button("Add to Guide Selection ➕", key="btn_add_manual_concept"):
+            clean_top = manual_topic.strip()
+            subj_val = manual_subj.strip() or "General Academic"
+            if clean_top:
+                # Subject-aware deduplication check against all existing concept options
+                existing_pairs = {
+                    (c.get("subject", "General Academic").strip().lower(), c["topic"].strip().lower())
+                    for c in (available_concepts + st.session_state["psg_custom_list"])
+                }
+                if (subj_val.lower(), clean_top.lower()) in existing_pairs:
+                    st.info(f"'{clean_top}' in {subj_val} is already present in your available concepts list.")
+                else:
+                    custom_id = f"custom_{len(st.session_state['psg_custom_list']) + 1}_{re.sub(r'[^a-zA-Z0-9]', '_', clean_top[:20])}"
+                    new_item = {
+                        "id": custom_id,
+                        "topic": clean_top,
+                        "subject": subj_val,
+                        "source": "Manual Selection",
+                        "mistakes": [],
+                        "description": f"Learner-added study topic ({current_grade})"
+                    }
+                    st.session_state["psg_custom_list"].append(new_item)
+                    # Automatically select the new concept in multiselect
+                    cur_sel = list(st.session_state.get("psg_concept_multiselect", []))
+                    if custom_id not in cur_sel:
+                        st.session_state["psg_concept_multiselect"] = cur_sel + [custom_id]
+                    st.success(f"Added '{clean_top}' to your selected concepts list!")
+                    st.rerun()
+            else:
+                st.warning("Please enter a concept or topic name.")
+
+    # Deduplicate combined concepts by (subject, topic)
+    seen_concepts = set()
+    all_selectable = []
+    for c in (available_concepts + st.session_state["psg_custom_list"]):
+        k = (c.get("subject", "General").strip().lower(), c["topic"].strip().lower())
+        if k not in seen_concepts:
+            seen_concepts.add(k)
+            all_selectable.append(c)
+
+    if all_selectable:
+        id_to_concept = {c["id"]: c for c in all_selectable}
+        concept_ids = [c["id"] for c in all_selectable]
+
+        def _format_concept_option(cid):
+            c = id_to_concept.get(cid)
+            if not c:
+                return str(cid)
+            t = c["topic"].strip()
+            short_top = (t[:50] + "...") if len(t) > 50 else t
+            return f"{short_top} · {c.get('subject', 'General')} ({c.get('source', 'Recorded')})"
+
+        # Initialize or sanitize selections with stable internal IDs
+        if "psg_concept_multiselect" not in st.session_state:
+            st.session_state["psg_concept_multiselect"] = concept_ids[:min(5, len(concept_ids))]
+        else:
+            st.session_state["psg_concept_multiselect"] = [
+                cid for cid in st.session_state["psg_concept_multiselect"] if cid in id_to_concept
+            ]
+
+        selected_ids = st.multiselect(
+            "Choose concepts to compile:",
+            options=concept_ids,
+            format_func=_format_concept_option,
+            key="psg_concept_multiselect",
+            help="Select one or more topics to generate detailed explanations, worked examples, and exam formulas."
+        )
+
+        selected_concept_objs = [id_to_concept[cid] for cid in selected_ids if cid in id_to_concept]
+    else:
+        selected_concept_objs = []
+        st.info("💡 You have no recorded learning history yet. Use 'Add Custom Topics / Concepts Manually' above to add any topics you wish to include in your study guide!")
+
+    # Action bar
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    c_btn1, c_btn2 = st.columns([1.5, 1])
+
+    with c_btn1:
+        btn_disabled = (len(selected_concept_objs) == 0)
+        generate_clicked = st.button(
+            "Generate Personal Study Guide ✨",
+            type="primary",
+            disabled=btn_disabled,
+            width="stretch",
+            key="btn_generate_study_guide"
+        )
+
+    with c_btn2:
+        if st.session_state.get("active_study_guide"):
+            if st.button("Clear / Reset Guide 🔄", width="stretch", key="btn_clear_study_guide"):
+                st.session_state.pop("active_study_guide", None)
+                st.session_state.pop("psg_pdf_bytes", None)
+                st.session_state.pop("psg_last_error", None)
+                st.rerun()
+
+    if st.session_state.get("psg_last_error"):
+        st.error(f"⚠️ Study Guide compilation could not be completed: {st.session_state['psg_last_error']}")
+        st.info("Your selected concepts have been preserved above. You can retry generation now.")
+        if st.button("Retry Generation 🔄", key="btn_retry_study_guide", width="stretch"):
+            generate_clicked = True
+
+    if generate_clicked:
+        if not selected_concept_objs:
+            st.warning("Please select or add at least one concept to generate your study guide.")
+        else:
+            with st.spinner(f"Compiling personalized study guide for {len(selected_concept_objs)} concept(s) calibrated to {current_grade} ({current_curriculum})..."):
+                try:
+                    guide_sections = []
+                    tb_sessions = get_textbook_sessions(student_id, limit=20)
+                    tb_extract_map = {s["title"].lower(): s.get("extracted_text", "") for s in tb_sessions if s.get("extracted_text")}
+
+                    for c in selected_concept_objs:
+                        top_name = c["topic"]
+                        subj_name = c.get("subject", "General")
+                        rec_mistakes = c.get("mistakes", [])
+                        src_extract = tb_extract_map.get(top_name.lower(), "")
+                        sec_data = generate_single_concept_guide(
+                            gemini=gemini,
+                            topic=top_name,
+                            subject=subj_name,
+                            stage=current_grade,
+                            curriculum=current_curriculum,
+                            recorded_mistakes=rec_mistakes,
+                            source_extract=src_extract,
+                            custom_syllabus=st.session_state.get("custom_board_text", "")
+                        )
+                        guide_sections.append(sec_data)
+
+                    pdf_bytes = create_study_guide_pdf(
+                        guide_sections=guide_sections,
+                        student_name=student_rec["name"],
+                        grade=current_grade,
+                        curriculum=current_curriculum
+                    )
+
+                    st.session_state["active_study_guide"] = {
+                        "sections": guide_sections,
+                        "student_name": student_rec["name"],
+                        "grade": current_grade,
+                        "curriculum": current_curriculum,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    }
+                    st.session_state["psg_pdf_bytes"] = pdf_bytes
+                    st.session_state.pop("psg_last_error", None)
+                    st.success("Study guide compiled successfully! Preview below and download your PDF.")
+                    st.rerun()
+                except Exception as exc:
+                    logger.error("Study Guide generation failed: %s", exc)
+                    st.session_state["psg_last_error"] = str(exc)
+                    st.rerun()
+
+    # Display Active Guide Preview & Download
+    active_guide = st.session_state.get("active_study_guide")
+    pdf_bytes = st.session_state.get("psg_pdf_bytes")
+
+    if active_guide and pdf_bytes:
+        st.divider()
+        st.markdown(f"### 📄 Study Guide Ready ({len(active_guide['sections'])} Concepts · {active_guide['timestamp']})")
+
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', student_rec['name'])
+        st.download_button(
+            label="📥 Download Personal Study Guide (PDF)",
+            data=pdf_bytes,
+            file_name=f"Bloom_Study_Guide_{safe_name}_{current_grade.replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            type="primary",
+            width="stretch",
+            key="btn_download_study_guide_pdf"
+        )
+
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("#### 📖 Guide Contents Preview")
+        for idx, sec in enumerate(active_guide["sections"], 1):
+            with st.expander(f"{idx}. {sec['topic']} ({sec['subject']})", expanded=(idx == 1)):
+                st.markdown(f"**Concept Intuition:** {sec.get('plain_explanation', '')}")
+                st.markdown(f"**Deep Level Understanding:**\n\n{sec.get('deep_explanation', '')}")
+                if sec.get("why_it_matters"):
+                    st.markdown(f"**Why It Matters & Prerequisites:**\n\n{sec['why_it_matters']}")
+                if sec.get("step_by_step_method"):
+                    st.markdown(f"**Step-by-Step Solving Method:**\n\n{sec['step_by_step_method']}")
+                if sec.get("worked_example"):
+                    st.markdown(f"**Worked Example:**\n\n{sec['worked_example']}")
+                if sec.get("formulas"):
+                    st.markdown(f"**Essential Formulas:**\n\n{sec['formulas']}")
+                if sec.get("definitions"):
+                    st.markdown(f"**Key Definitions:**\n\n{sec['definitions']}")
+                if sec.get("common_mistakes"):
+                    st.markdown(f"**Common Mistakes to Avoid:**\n\n{sec['common_mistakes']}")
+                if sec.get("practice_questions"):
+                    st.markdown("**Practice Check Questions:**")
+                    for p_i, pq in enumerate(sec["practice_questions"], 1):
+                        st.markdown(f"*Q{p_i}:* {pq.get('question', '')}\n\n*Answer:* {pq.get('answer', '')} — *{pq.get('explanation', '')}*")
+                if sec.get("quick_summary"):
+                    st.markdown("**Quick Revision Checklist:**")
+                    if isinstance(sec["quick_summary"], list):
+                        for item in sec["quick_summary"]:
+                            st.markdown(f"- {item}")
+                    else:
+                        st.markdown(str(sec["quick_summary"]))
+
+# ---------------------------------------------------------
+# SECTION 7: MY PROGRESS
 # ---------------------------------------------------------
 
 elif page == "My progress":
@@ -2069,9 +2384,10 @@ elif page == "My progress":
                         xaxis_title="Assessment Date",
                         yaxis_title="Accuracy (%)",
                         xaxis=dict(gridcolor="#283a2f"),
-                        yaxis=dict(gridcolor="#283a2f")
+                        yaxis=dict(gridcolor="#283a2f"),
+                        dragmode=False
                     )
-                    st.plotly_chart(fig1, use_container_width=True)
+                    st.plotly_chart(fig1, width="stretch", config=CHART_CONFIG)
                 else:
                     curr_acc = trend["Accuracy"].iloc[0] if not trend.empty else 0
                     st.markdown(f"""
@@ -2109,9 +2425,10 @@ elif page == "My progress":
                         xaxis_title="",
                         yaxis_title="Questions Attempted",
                         xaxis=dict(type="category", gridcolor="#283a2f", tickfont=dict(color="#b5cbbb", size=11)),
-                        yaxis=dict(gridcolor="#283a2f", dtick=1, rangemode="tozero", tickfont=dict(color="#b5cbbb", size=11))
+                        yaxis=dict(gridcolor="#283a2f", dtick=1, rangemode="tozero", tickfont=dict(color="#b5cbbb", size=11)),
+                        dragmode=False
                     )
-                    st.plotly_chart(fig_daily, use_container_width=True)
+                    st.plotly_chart(fig_daily, width="stretch", config=CHART_CONFIG)
 
             # Mistake Pattern Distribution
             st.markdown("### Mistake Pattern Breakdown")
@@ -2132,9 +2449,10 @@ elif page == "My progress":
                     plot_bgcolor="rgba(0,0,0,0)",
                     font_color="#b5cbbb",
                     xaxis=dict(gridcolor="#283a2f"),
-                    yaxis=dict(gridcolor="#283a2f")
+                    yaxis=dict(gridcolor="#283a2f"),
+                    dragmode=False
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch", config=CHART_CONFIG)
             else:
                 st.info("No incorrect answers recorded yet! Keep up the great work.")
 
@@ -2148,7 +2466,7 @@ elif page == "My progress":
                 "mistake_type": "Pattern",
                 "mode": "Mode"
             })
-            st.dataframe(show_df.head(30), use_container_width=True, hide_index=True)
+            st.dataframe(show_df.head(30), width="stretch", hide_index=True)
 
             csv_data = df.to_csv(index=False).encode("utf-8")
             st.download_button(
@@ -2170,7 +2488,7 @@ elif page == "My progress":
                 "percentage": "Percentage",
                 "mistake_types": "Noted Mistakes"
             })
-            st.dataframe(display_tests, use_container_width=True, hide_index=True)
+            st.dataframe(display_tests, width="stretch", hide_index=True)
 
         if recall_logs:
             st.markdown("### Active Recall History")
@@ -2182,7 +2500,7 @@ elif page == "My progress":
                 "self_eval": "Self-Assessment",
                 "response": "Learner Response"
             })
-            st.dataframe(display_recall.head(25), use_container_width=True, hide_index=True)
+            st.dataframe(display_recall.head(25), width="stretch", hide_index=True)
 
     else:
         st.markdown("""

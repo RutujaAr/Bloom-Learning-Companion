@@ -1,8 +1,49 @@
 import sqlite3
 from pathlib import Path
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 import os
+
+LOCAL_TIMEZONE_NAME = "Asia/Kolkata"
+LOCAL_TZ = ZoneInfo(LOCAL_TIMEZONE_NAME)
+
+def format_local_timestamp(ts, fmt="%Y-%m-%d %H:%M", target_tz=LOCAL_TZ):
+    """
+    Convert a database UTC timestamp (string or datetime) to the user's local display timezone.
+    Convention:
+      - Timestamps in SQLite (CURRENT_TIMESTAMP) are stored in UTC 'YYYY-MM-DD HH:MM:SS'.
+      - Naive timestamps from the DB are treated as UTC as per the storage convention.
+      - Aware timestamps (with tzinfo or offset) are converted to target_tz without double-conversion.
+      - Handles date rollover accurately.
+      - If parsing fails, returns the string safely.
+    """
+    if not ts:
+        return ""
+    if isinstance(ts, datetime):
+        dt = ts
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(target_tz).strftime(fmt)
+    
+    ts_str = str(ts).strip()
+    for pattern in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"]:
+        try:
+            dt = datetime.strptime(ts_str, pattern)
+            dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(target_tz).strftime(fmt)
+        except ValueError:
+            continue
+            
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(target_tz).strftime(fmt)
+    except Exception:
+        pass
+        
+    return ts_str[:16]
 
 DB_PATH = os.getenv("BLOOM_DB_PATH", str(Path(__file__).resolve().parent.parent / "bloom.db"))
 
@@ -43,6 +84,7 @@ def init_db():
           name TEXT NOT NULL,
           email TEXT,
           grade TEXT NOT NULL,
+          curriculum TEXT DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS attempts (
@@ -133,6 +175,12 @@ def init_db():
 
         # 2. Check if students table requires migration to modern unique username and owner architecture
         cols = [r["name"] for r in c.execute("PRAGMA table_info(students)").fetchall()]
+        if "curriculum" not in cols:
+            try:
+                c.execute("ALTER TABLE students ADD COLUMN curriculum TEXT DEFAULT ''")
+            except Exception:
+                pass
+
         table_sql_row = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='students'").fetchone()
         table_sql = table_sql_row["sql"] if table_sql_row else ""
 
@@ -167,6 +215,7 @@ def _migrate_students_table_schema():
           name TEXT NOT NULL,
           email TEXT,
           grade TEXT NOT NULL,
+          curriculum TEXT DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """)
@@ -184,6 +233,7 @@ def _migrate_students_table_schema():
             rname = row.get("name") or "Learner"
             rgrade = row.get("grade") or "Class 10"
             remail = row.get("email") or None
+            rcurr = row.get("curriculum") or ""
             rcreated = row.get("created_at") or datetime.now().isoformat()
             row_owner = (row.get("owner_id") or "").strip()
 
@@ -218,9 +268,9 @@ def _migrate_students_table_schema():
             used_usernames.add(username)
 
             conn.execute(
-                "INSERT INTO students_migrated(id, owner_id, username, password_hash, name, email, grade, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (rid, row_owner, username, pwd_hash, rname, remail, rgrade, rcreated)
+                "INSERT INTO students_migrated(id, owner_id, username, password_hash, name, email, grade, curriculum, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (rid, row_owner, username, pwd_hash, rname, remail, rgrade, rcurr, rcreated)
             )
 
         conn.execute("DROP TABLE students")
@@ -255,8 +305,8 @@ def create_user_account(username, password_hash, display_name, grade="Class 10",
 
         try:
             cur = c.execute(
-                "INSERT INTO students(owner_id, username, password_hash, name, email, grade) VALUES(?,?,?,?,?,?)",
-                (clean_owner, clean_username, password_hash, clean_name, clean_email, clean_grade)
+                "INSERT INTO students(owner_id, username, password_hash, name, email, grade, curriculum) VALUES(?,?,?,?,?,?,?)",
+                (clean_owner, clean_username, password_hash, clean_name, clean_email, clean_grade, "")
             )
             new_id = cur.lastrowid
             return dict(c.execute("SELECT * FROM students WHERE id=?", (new_id,)).fetchone())
@@ -289,7 +339,7 @@ def get_student_by_owner_id(owner_id: str):
         row = c.execute("SELECT * FROM students WHERE owner_id=?", (clean_owner,)).fetchone()
         return dict(row) if row else None
 
-def get_or_create_account(owner_id, display_name=None, email=None, grade="Class 10"):
+def get_or_create_account(owner_id, display_name=None, email=None, grade=None):
     """
     Retrieve or create an account for an authenticated owner.
     Editing the display name or grade updates this student's profile without
@@ -298,17 +348,18 @@ def get_or_create_account(owner_id, display_name=None, email=None, grade="Class 
     clean_owner = (owner_id or "").strip()
     if not clean_owner:
         clean_owner = "local_dev_learner"
-    clean_name = (display_name or "Learner").strip() or "Learner"
-    clean_grade = (grade or "Class 10").strip()
-    clean_email = (email or "").strip()
 
     with get_connection() as c:
         row = c.execute("SELECT * FROM students WHERE owner_id=?", (clean_owner,)).fetchone()
         if row:
             current = dict(row)
-            upd_name = clean_name if (display_name and clean_name != current.get("name")) else current.get("name")
-            upd_grade = clean_grade if (grade and clean_grade != current.get("grade")) else current.get("grade")
-            upd_email = clean_email if (email and clean_email != current.get("email")) else current.get("email")
+            clean_name = display_name.strip() if display_name else ""
+            clean_grade = grade.strip() if grade else ""
+            clean_email = email.strip() if email else ""
+
+            upd_name = clean_name if (clean_name and clean_name != current.get("name")) else current.get("name")
+            upd_grade = clean_grade if (clean_grade and clean_grade != current.get("grade")) else current.get("grade")
+            upd_email = clean_email if (clean_email and clean_email != current.get("email")) else current.get("email")
 
             if upd_name != current.get("name") or upd_grade != current.get("grade") or upd_email != current.get("email"):
                 c.execute(
@@ -318,7 +369,11 @@ def get_or_create_account(owner_id, display_name=None, email=None, grade="Class 
                 return dict(c.execute("SELECT * FROM students WHERE id=?", (current["id"],)).fetchone())
             return current
 
-        # Generate a candidate username and bcrypt password hash for this account
+        # Generate a candidate username and bcrypt password hash for new account
+        clean_name = (display_name or "Learner").strip() or "Learner"
+        clean_grade = (grade or "Class 10").strip() or "Class 10"
+        clean_email = (email or "").strip()
+
         base_u = clean_name.lower().replace(" ", "_")
         candidate_u = base_u
         idx = 1
@@ -329,13 +384,13 @@ def get_or_create_account(owner_id, display_name=None, email=None, grade="Class 
         import bcrypt
         default_hash = bcrypt.hashpw(b"bloom123", bcrypt.gensalt()).decode("utf-8")
         cur = c.execute(
-            "INSERT INTO students(owner_id, username, password_hash, name, email, grade) VALUES(?,?,?,?,?,?)",
-            (clean_owner, candidate_u, default_hash, clean_name, clean_email, clean_grade)
+            "INSERT INTO students(owner_id, username, password_hash, name, email, grade, curriculum) VALUES(?,?,?,?,?,?,?)",
+            (clean_owner, candidate_u, default_hash, clean_name, clean_email, clean_grade, "")
         )
         new_id = cur.lastrowid
         return dict(c.execute("SELECT * FROM students WHERE id=?", (new_id,)).fetchone())
 
-def update_student_profile(student_id, owner_id, display_name=None, grade=None):
+def update_student_profile(student_id, owner_id, display_name=None, grade=None, curriculum=None):
     """Update profile fields for an authenticated student record in place."""
     with get_connection() as c:
         row = c.execute("SELECT * FROM students WHERE id=? AND owner_id=?", (student_id, owner_id)).fetchone()
@@ -343,7 +398,13 @@ def update_student_profile(student_id, owner_id, display_name=None, grade=None):
             return None
         new_name = (display_name or row["name"]).strip() or row["name"]
         new_grade = (grade or row["grade"]).strip() or row["grade"]
-        c.execute("UPDATE students SET name=?, grade=? WHERE id=? AND owner_id=?", (new_name, new_grade, student_id, owner_id))
+        curr_val = curriculum if curriculum is not None else (row["curriculum"] if "curriculum" in row.keys() else "")
+        try:
+            c.execute("UPDATE students SET name=?, grade=?, curriculum=? WHERE id=? AND owner_id=?", 
+                      (new_name, new_grade, curr_val, student_id, owner_id))
+        except Exception:
+            c.execute("UPDATE students SET name=?, grade=? WHERE id=? AND owner_id=?", 
+                      (new_name, new_grade, student_id, owner_id))
         return dict(c.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone())
 
 def migrate_legacy_student(legacy_student_id: int, new_owner_id: str) -> bool:
@@ -552,22 +613,26 @@ def get_test_sessions(student_id, subject=None, topic=None, limit=100, order="AS
 
 def save_textbook_session(student_id, title, source_type, source_name, extracted_text="",
                           file_path=None, file_hash=None, file_size=0, page_count=1,
-                          word_count=0, is_truncated=0, truncation_info="", **kwargs):
-    """Persist a new textbook study session with extracted source text and document metadata."""
+                          word_count=0, is_truncated=0, truncation_info="", created_at=None, **kwargs):
+    """Persist a new textbook study session with extracted source text, document metadata, and explicit UTC creation timestamp."""
     path = file_path or kwargs.get("storage_path")
     text = extracted_text or kwargs.get("text", "")
     w_count = word_count or kwargs.get("accepted_words", 0) or kwargs.get("total_words", 0)
     trunc = is_truncated if is_truncated is not None else kwargs.get("is_truncated", 0)
+    utc_now = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     with get_connection() as c:
         cur = c.execute("""
             INSERT INTO textbook_sessions(
                 student_id, title, source_type, source_name, file_path, file_hash,
-                file_size, extracted_text, page_count, word_count, is_truncated, truncation_info
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_size, extracted_text, page_count, word_count, is_truncated, truncation_info,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             student_id, title, source_type, source_name, path, file_hash,
             int(file_size), text, int(page_count), int(w_count),
-            int(bool(trunc)), str(truncation_info or "")
+            int(bool(trunc)), str(truncation_info or ""),
+            utc_now, utc_now
         ))
         return cur.lastrowid
 
@@ -576,7 +641,7 @@ def get_textbook_sessions(student_id, limit=50):
     with get_connection() as c:
         rows = c.execute("""
             SELECT id, student_id, title, source_type, source_name, file_path, file_hash,
-                   file_size, page_count, word_count, is_truncated, truncation_info,
+                   file_size, extracted_text, page_count, word_count, is_truncated, truncation_info,
                    created_at, updated_at
             FROM textbook_sessions
             WHERE student_id=?
@@ -587,6 +652,7 @@ def get_textbook_sessions(student_id, limit=50):
             d = dict(r)
             d["storage_path"] = d.get("file_path")
             d["accepted_words"] = d.get("word_count", 0)
+            d["extracted_text"] = d.get("extracted_text") or ""
             result.append(d)
         return result
 
@@ -608,6 +674,7 @@ def get_textbook_session(student_id_or_session_id, session_id=None):
         d = dict(row)
         d["storage_path"] = d.get("file_path")
         d["accepted_words"] = d.get("word_count", 0)
+        d["extracted_text"] = d.get("extracted_text") or ""
         return d
 
 def delete_textbook_session(arg1, arg2=None):

@@ -18,7 +18,7 @@ from agents.gap_finder import (
 def test_simple_live_api_request():
     """
     Test one simple live API request separately from the diagnostic workflow
-    using the configured Gemini API and default model (gemini-3.8-flash).
+    using the configured Gemini API and default model (gemini-3.5-flash-lite).
     Records duration, result, and sanitized error category.
     """
     svc = GeminiService()
@@ -50,7 +50,7 @@ class MockLiveGemini:
     """Mock Gemini service to verify end-to-end arbitrary academic topic generation without consuming quota."""
     def __init__(self, responses):
         self.responses = list(responses)
-        self.model = "gemini-3.8-flash"
+        self.model = "gemini-3.5-flash-lite"
         self.last_metrics = {"attempts": [{"attempt": 1, "duration_s": 1.2, "status": "success", "code": 200}], "timeout_occurred": False}
 
     def available(self):

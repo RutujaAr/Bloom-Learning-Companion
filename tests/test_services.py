@@ -27,7 +27,7 @@ def test_pdf_relevant_context_finder():
 
 def test_gemini_service_unavailable_state():
     gs = GeminiService()
-    assert gs.DEFAULT_MODEL == "gemini-3.8-flash"
+    assert gs.DEFAULT_MODEL == "gemini-3.5-flash-lite"
     # Without an API key, available() must be False and generate_text must return informative notice
     if not gs.api_key:
         assert gs.available() is False

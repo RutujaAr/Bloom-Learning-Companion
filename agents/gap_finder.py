@@ -1,8 +1,11 @@
 import time
 import json
 import re
+import logging
 from uuid import uuid4
-from core.syllabus import get_syllabus_context
+from core.syllabus import get_syllabus_context, build_curriculum_context
+
+logger = logging.getLogger(__name__)
 
 BANKS = {
     "math": [
@@ -286,7 +289,7 @@ LAST_DIAGNOSTIC_METRICS = {
     "source_used": "none",
     "question_count": 0,
     "api_attempts": [],
-    "model": "gemini-3.8-flash",
+    "model": "gemini-3.5-flash-lite",
     "timed_out": False
 }
 
@@ -360,6 +363,8 @@ def _validate_question_structure(item):
     """Validate that question dictionary satisfies strict multi-choice schema and answer key consistency."""
     if not isinstance(item, dict):
         return False, "Not a dictionary"
+    if "answer" not in item and "correct_answer" in item:
+        item["answer"] = item["correct_answer"]
     for key in ["prompt", "options", "answer", "explanation"]:
         if key not in item or not str(item[key]).strip():
             return False, f"Missing or empty '{key}'"
@@ -481,52 +486,140 @@ def _validate_question_topic_relevance(item, requested_topic, subject=""):
 
     return False, f"Question did not address requested topic '{requested_topic}'"
 
+def _sanitize_json_escapes(raw_json: str) -> str:
+    r"""
+    Sanitize unescaped or LaTeX backslashes inside JSON strings.
+    In valid JSON (RFC 8259), only \", \\, \/, \b, \f, \n, \r, \t, and \uXXXX are allowed.
+    Uses backslash parity inspection so already-escaped sequences (like \\) are not
+    corrupted into odd backslashes.
+    Preserves mathematical expressions by protecting LaTeX commands whose initial letters
+    collide with standard single-character JSON escapes (e.g. \frac, \times, \theta, \beta, \rho).
+    """
+    if not raw_json:
+        return ""
+
+    # Protect LaTeX commands where initial letter collides with JSON escapes:
+    # \f -> \frac
+    # \t -> \times, \theta, \tau, \tan, \text, \to, \top, \textbf, \textit
+    # \b -> \bar, \beta, \binom, \begin, \bold, \boldsymbol
+    # \r -> \rho, \right, \rangle, \rm
+    # \n -> \nabla, \neq, \nu, \neg, \not, \norm, \notin
+    # \u -> \underline, \underbrace, \uparrow, \upsilon
+    latex_collide = re.compile(
+        r'(\\+)(frac|times|theta|tau|tan|text|to\b|top\b|textbf|textit|bar|beta|binom|begin|bold|boldsymbol|rho|right|rangle|rm\b|nabla|neq|nu\b|neg|not\b|norm|notin|underline|underbrace|uparrow|upsilon)',
+        re.IGNORECASE
+    )
+    def repl_latex(m):
+        slashes = m.group(1)
+        word = m.group(2)
+        if len(slashes) % 2 == 1:
+            return slashes + '\\' + word
+        return slashes + word
+
+    step1 = latex_collide.sub(repl_latex, raw_json)
+
+    def repl(m):
+        slashes = m.group(1)
+        next_char = m.group(2)
+        if len(slashes) % 2 == 1:
+            # Odd number of backslashes: check if next_char is a valid JSON escape
+            if next_char in '"\\/bfnrt':
+                return slashes + next_char
+            return slashes + '\\' + next_char
+        return slashes + next_char
+
+    cleaned = re.sub(r'(\\+)(.)', repl, step1, flags=re.DOTALL)
+    # Also clean trailing commas before array/object close: [..., ] or {..., }
+    cleaned = re.sub(r',\s*([\]}])', r'\1', cleaned)
+    return cleaned
+
 def _extract_and_parse_json(raw):
     """
     Safely extract JSON array of question dicts from raw model output.
-    Handles markdown fences (```json), leading/trailing prose, and partial truncations.
+    Handles markdown fences (```json), leading/trailing prose, unescaped LaTeX backslashes,
+    trailing commas, and partial truncations.
     """
     if not raw or not isinstance(raw, str):
         return None
 
     clean = raw.strip()
-    if "```" in clean:
-        clean = re.sub(r"^```[a-zA-Z]*\n?", "", clean)
-        clean = re.sub(r"\n?```$", "", clean).strip()
 
-    # 1. Direct parse attempt
-    try:
-        parsed = json.loads(clean)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict) and "questions" in parsed and isinstance(parsed["questions"], list):
-            return parsed["questions"]
-    except Exception:
-        pass
+    # 1. First extract from markdown code fences if present
+    fence_match = re.search(r"```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```", clean, re.DOTALL | re.IGNORECASE)
+    candidate_strings = []
+    if fence_match:
+        candidate_strings.append(fence_match.group(1))
+
+    # Strip fences from clean as well
+    clean_no_fence = re.sub(r"^```[a-zA-Z]*\n?", "", clean)
+    clean_no_fence = re.sub(r"\n?```$", "", clean_no_fence).strip()
+    candidate_strings.append(clean_no_fence)
 
     # 2. Extract substring between first '[' and last ']'
-    start_idx = clean.find("[")
-    end_idx = clean.rfind("]")
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+    start_bracket = clean.find("[")
+    end_bracket = clean.rfind("]")
+    if start_bracket != -1 and end_bracket > start_bracket:
+        candidate_strings.append(clean[start_bracket:end_bracket + 1])
+
+    # 3. Extract substring between first '{' and last '}' (for dict with 'questions' key)
+    start_brace = clean.find("{")
+    end_brace = clean.rfind("}")
+    if start_brace != -1 and end_brace > start_brace:
+        candidate_strings.append(clean[start_brace:end_brace + 1])
+
+    for cand in candidate_strings:
+        if not cand:
+            continue
+        # Direct parse attempt
         try:
-            parsed = json.loads(clean[start_idx:end_idx + 1])
+            parsed = json.loads(cand, strict=False)
             if isinstance(parsed, list):
                 return parsed
+            if isinstance(parsed, dict) and "questions" in parsed and isinstance(parsed["questions"], list):
+                return parsed["questions"]
         except Exception:
             pass
 
-    # 3. Recover partial JSON if model was truncated before closing ']'
-    if start_idx != -1:
+        # Sanitized parse attempt (doubles invalid LaTeX escapes and strips trailing commas)
+        try:
+            sanitized = _sanitize_json_escapes(cand)
+            parsed = json.loads(sanitized, strict=False)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict) and "questions" in parsed and isinstance(parsed["questions"], list):
+                return parsed["questions"]
+        except Exception:
+            pass
+
+    # 4. Recover partial JSON if model was truncated before closing ']'
+    if start_bracket != -1:
         last_brace = clean.rfind("}")
-        if last_brace > start_idx:
-            recovered_str = clean[start_idx:last_brace + 1] + "\n]"
+        if last_brace > start_bracket:
+            recovered_str = clean[start_bracket:last_brace + 1] + "\n]"
             try:
-                parsed = json.loads(recovered_str)
+                sanitized_rec = _sanitize_json_escapes(recovered_str)
+                parsed = json.loads(sanitized_rec, strict=False)
                 if isinstance(parsed, list) and len(parsed) > 0:
                     return parsed
             except Exception:
                 pass
 
+    # 5. Regex extraction of individual valid question objects
+    extracted_objects = []
+    obj_pattern = re.compile(r'\{[^{}]*"prompt"\s*:\s*"[^"]+".*?"options"\s*:\s*\[.*?\].*?\}', re.DOTALL)
+    for m in obj_pattern.finditer(clean):
+        try:
+            obj_str = _sanitize_json_escapes(m.group(0))
+            item = json.loads(obj_str, strict=False)
+            if isinstance(item, dict) and "prompt" in item and "options" in item:
+                extracted_objects.append(item)
+        except Exception:
+            pass
+
+    if extracted_objects:
+        return extracted_objects
+
+    logger.warning("Diagnostic response parsing failed | raw_len=%d", len(raw))
     return None
 
 def run_diagnostic(
@@ -538,10 +631,13 @@ def run_diagnostic(
     stage="Class 10",
     curriculum="CBSE (Verified 2024-25)",
     previous_questions=None,
-    timeout_ms=None
+    timeout_ms=None,
+    custom_syllabus="",
+    grade=None
 ):
     """
     Run diagnostic question generation with:
+    - Genuine curriculum & education stage academic calibration
     - Syllabus grounding without fabrication
     - Exam-style multi-step problem solving & reasoning
     - Distractors matching common misconceptions
@@ -549,33 +645,36 @@ def run_diagnostic(
     - Single-pass bounded execution for fast responsiveness
     - Curated offline fallback validation matching requested topic
     - Precise per-attempt and total duration metrics
+    - Actionable error category reporting when question generation cannot proceed
     """
     global LAST_DIAGNOSTIC_METRICS
 
+    # Support both stage and grade parameters for seamless compatibility
+    if grade and not stage:
+        stage = grade
+    elif grade and stage == "Class 10" and grade != "Class 10":
+        stage = grade
+
     t_total_start = time.time()
     count = max(3, min(10, int(count)))
+    clean_topic = (topic or "").strip()
     norm_previous = {normalize_question_prompt(q) for q in (previous_questions or []) if q}
 
-    # 1. Syllabus lookup measurement (keyed by curriculum, stage, subject, topic)
+    # 1. Syllabus & Academic Context construction
     t_syl_start = time.time()
-    syl = get_syllabus_context(stage, curriculum, subject, topic)
+    syl = get_syllabus_context(stage, curriculum, subject, clean_topic)
+    academic_ctx = build_curriculum_context(stage, curriculum, subject, clean_topic, custom_syllabus=custom_syllabus)
     t_syl_elapsed = time.time() - t_syl_start
-
-    syllabus_info = (
-        f"Verified Board Curriculum: {syl['curriculum']}\n"
-        f"Syllabus Source: {syl['source']}\n"
-        f"Unit/Chapters: {syl.get('chapters') or syl.get('unit')}\n"
-        f"Target Learning Outcomes: {syl.get('outcomes')}\n"
-        f"Board Exam Style: {syl.get('exam_style')}"
-        if syl.get("verified") else
-        f"Course Framework: {syl['curriculum']} ({syl['source']})\n"
-        f"Topic Focus: {topic}\n"
-        f"Target Outcomes: {syl.get('outcomes')}"
-    )
 
     valid_questions = []
     collected_prompts = set()
     ai_elapsed = 0.0
+    raw = None
+    parsed = None
+    struct_valid_count = 0
+    topic_valid_count = 0
+    repetition_count = 0
+    validation_rejections = []
 
     if gemini and getattr(gemini, "available", lambda: False)():
         # Build prompt with progression and anti-repetition instructions
@@ -585,9 +684,10 @@ def run_diagnostic(
             avoid_clause = f"IMPORTANT ANTI-REPETITION: Do NOT generate questions semantically similar to these previously seen questions:\n- " + "\n- ".join(prev_examples) + "\n"
 
         system_instruction = f"""You are an expert exam question creator designing a high-yield diagnostic assessment for a {stage} student.
-{syllabus_info}
+{academic_ctx}
+
 Target Subject: {subject}
-Target Topic: {topic}
+Target Topic: {clean_topic}
 Difficulty Level: {level}
 Number of Questions: {count}
 
@@ -599,7 +699,7 @@ PEDAGOGICAL & EXAM STANDARDS:
 5. EXPLANATION: Concise worked explanation (1-2 sentences) showing why the answer is correct and why other options fail.
 6. HINT: Offer a constructive clue without giving the answer away.
 7. MISTAKE_TYPE: Tag each question with one of: conceptual, calculation, misread, recall, incomplete.
-8. TOPIC SPECIFICITY: Every question must directly test concepts, mechanisms, algorithms, problem-solving, or principles of the requested topic '{topic}'. Explicitly reference key terms or principles of '{topic}' in the question prompt or explanation.
+8. TOPIC SPECIFICITY: Every question must directly test concepts, mechanisms, algorithms, problem-solving, or principles of the requested topic '{clean_topic}'. Explicitly reference key terms or principles of '{clean_topic}' in the question prompt or explanation.
 
 {avoid_clause}
 RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
@@ -613,11 +713,12 @@ RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
         # Bounded generation pass with end-to-end latency budget
         t_ai_start = time.time()
         output_tokens = max(2048, count * 600)
+        diag_timeout = timeout_ms if timeout_ms is not None else getattr(gemini, "diagnostic_timeout_ms", 30000)
         try:
             raw, _ = gemini.generate_text(
                 system_instruction,
                 max_output_tokens=output_tokens,
-                timeout_ms=timeout_ms
+                timeout_ms=diag_timeout
             )
         except TypeError:
             raw, _ = gemini.generate_text(
@@ -631,28 +732,61 @@ RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
                 parsed = _extract_and_parse_json(raw)
                 if isinstance(parsed, list):
                     for item in parsed:
-                        ok_struct, _ = _validate_question_structure(item)
+                        ok_struct, struct_reason = _validate_question_structure(item)
                         if not ok_struct:
+                            validation_rejections.append(f"structure: {struct_reason}")
                             continue
+                        struct_valid_count += 1
 
                         # Validate question topic relevance before accepting
-                        ok_topic, _ = _validate_question_topic_relevance(item, topic, subject)
+                        ok_topic, topic_reason = _validate_question_topic_relevance(item, clean_topic, subject)
                         if not ok_topic:
+                            validation_rejections.append(f"topic_relevance: {topic_reason}")
                             continue
+                        topic_valid_count += 1
 
                         norm_p = normalize_question_prompt(item["prompt"])
                         # Anti-repetition check against DB history and current batch
                         if norm_p in norm_previous or norm_p in collected_prompts:
+                            repetition_count += 1
                             continue
+
                         item["id"] = f"q_{uuid4().hex[:8]}"
                         item.setdefault("hint", "")
-                        item.setdefault("mistake_type", "conceptual")
+
+                        # Normalize mistake_type to standard Bloom types
+                        raw_m = str(item.get("mistake_type", "")).lower()
+                        if any(k in raw_m for k in ["calc", "math", "numeric", "formula", "algebra"]):
+                            item["mistake_type"] = "calculation"
+                        elif any(k in raw_m for k in ["recall", "memor", "fact", "term", "def"]):
+                            item["mistake_type"] = "recall"
+                        elif any(k in raw_m for k in ["misread", "read", "interpret", "slip", "overlook"]):
+                            item["mistake_type"] = "misread"
+                        elif any(k in raw_m for k in ["incomplet", "partial", "miss"]):
+                            item["mistake_type"] = "incomplete"
+                        else:
+                            item["mistake_type"] = "conceptual"
+
                         valid_questions.append(item)
                         collected_prompts.add(norm_p)
                         if len(valid_questions) >= count:
                             break
-            except Exception:
-                pass
+            except Exception as parse_exc:
+                logger.warning("Diagnostic parsing exception | topic=%s | error=%s", clean_topic, type(parse_exc).__name__)
+
+        logger.info(
+            "Diagnostic generation attempt summary | topic=%s | subject=%s | stage=%s | ai_elapsed=%.2fs | raw_len=%d | parsed=%d | struct_ok=%d | topic_ok=%d | repetition=%d | valid=%d",
+            clean_topic,
+            subject,
+            stage,
+            ai_elapsed,
+            len(raw) if raw else 0,
+            len(parsed) if isinstance(parsed, list) else 0,
+            struct_valid_count,
+            topic_valid_count,
+            repetition_count,
+            len(valid_questions)
+        )
 
         if len(valid_questions) >= count or len(valid_questions) >= 3:
             final_qs = valid_questions[:count] if len(valid_questions) >= count else valid_questions
@@ -660,7 +794,8 @@ RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
             status_text = alignment_status if len(valid_questions) >= count else f"{alignment_status} ({len(valid_questions)} unique questions)"
 
             gemini_metrics = getattr(gemini, "last_metrics", {})
-            LAST_DIAGNOSTIC_METRICS = {
+            LAST_DIAGNOSTIC_METRICS.clear()
+            LAST_DIAGNOSTIC_METRICS.update({
                 "syllabus_lookup_s": round(t_syl_elapsed, 6),
                 "ai_generation_s": ai_elapsed,
                 "fallback_lookup_s": 0.0,
@@ -668,27 +803,134 @@ RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
                 "source_used": "ai",
                 "question_count": len(final_qs),
                 "api_attempts": gemini_metrics.get("attempts", []),
-                "model": getattr(gemini, "model", "gemini-3.8-flash"),
-                "timed_out": False
-            }
+                "model": getattr(gemini, "model", "gemini-3.5-flash-lite"),
+                "timed_out": False,
+                "error_category": "none",
+                "error_reason": "none",
+                "fallback_matched": False
+            })
             return final_qs, status_text
+
+    # Diagnose the exact root cause of AI failure
+    error_category = "generation_failed"
+    error_reason = "We couldn't generate verified questions for this topic right now."
+    action_guidance = "Please try again in a few moments."
+    status_code = None
+    api_attempts = []
+    is_timeout = False
+    model_name = getattr(gemini, "model", "gemini-3.5-flash-lite") if gemini else "offline"
+
+    if not gemini or not getattr(gemini, "available", lambda: False)():
+        error_category = "unconfigured"
+        error_reason = "AI question generator is unconfigured or unavailable."
+        action_guidance = "Please check your connection and try again or verify that GEMINI_API_KEY is configured in your settings."
+    elif not raw:
+        gemini_metrics = getattr(gemini, "last_metrics", {}) or {}
+        api_attempts = gemini_metrics.get("attempts", [])
+        status_code = gemini_metrics.get("last_error_code") or gemini_metrics.get("status_code")
+        last_cat = gemini_metrics.get("last_error_category") or gemini_metrics.get("error_category") or ""
+        is_timeout = gemini_metrics.get("timeout_occurred", False) or last_cat == "timeout"
+        detail_msg = gemini_metrics.get("last_error_detail") or ""
+
+        if not status_code and api_attempts:
+            for att in api_attempts:
+                if att.get("code") is not None or att.get("status_code") is not None:
+                    status_code = att.get("code") or att.get("status_code")
+                    break
+        if not last_cat and api_attempts:
+            for att in api_attempts:
+                if att.get("status") and att.get("status") not in ("error", "failed"):
+                    last_cat = att.get("status")
+                    break
+                elif att.get("error") and "EXHAUSTED" in str(att.get("error")):
+                    last_cat = "quota"
+                    break
+
+        if is_timeout:
+            error_category = "timeout"
+            error_reason = "The AI question generation request timed out (30s deadline exceeded)."
+            action_guidance = "The AI service was slow to respond. Please try again or use a simpler topic name."
+        elif status_code == 429 or last_cat in ("quota", "quota_exceeded") or (status_code and "429" in str(status_code)):
+            error_category = "quota_exceeded"
+            error_reason = "AI rate limit or quota exceeded (HTTP 429)."
+            action_guidance = "Please wait a minute before requesting another assessment."
+        elif status_code in (401, 403) or last_cat == "authentication":
+            error_category = "authentication_error"
+            error_reason = f"AI authentication failed (HTTP {status_code or '401/403'})."
+            action_guidance = "Please verify your GEMINI_API_KEY."
+        elif last_cat == "connection_failure":
+            error_category = "connection_failure"
+            error_reason = "Could not connect to the AI service."
+            action_guidance = "Please check your network connection and try again."
+        elif status_code == 400 or last_cat == "invalid_request":
+            error_category = "invalid_request"
+            error_reason = f"AI request was rejected as invalid (HTTP {status_code or '400'})."
+            action_guidance = "Please check your input and try again."
+        elif status_code == 404 or last_cat == "model_not_found":
+            error_category = "model_not_found"
+            error_reason = f"The configured Gemini model '{model_name}' was not found (HTTP 404)."
+            action_guidance = "Please check model availability."
+        else:
+            error_category = last_cat or "ai_generation_failed"
+            error_reason = f"AI generation did not return a response ({detail_msg or last_cat or 'unknown'})."
+            action_guidance = "Please try again in a few moments."
+    elif raw and not parsed:
+        error_category = "parsing_failure"
+        error_reason = "The AI response could not be parsed into valid question data."
+        action_guidance = "Please click Try Again to regenerate fresh questions."
+    elif parsed and not valid_questions:
+        if struct_valid_count == 0:
+            error_category = "validation_failure"
+            error_reason = "Generated questions did not meet Bloom's schema (missing options, explanation, or answer key)."
+            action_guidance = "Please click Try Again to regenerate."
+        elif topic_valid_count == 0:
+            error_category = "relevance_mismatch"
+            error_reason = f"Generated questions did not sufficiently match the requested topic '{clean_topic}'."
+            action_guidance = "Please try using a more specific topic name or select a matching subject."
+        else:
+            error_category = "repetition_exhausted"
+            error_reason = f"All generated questions for '{clean_topic}' have already been attempted in previous sessions."
+            action_guidance = "Try exploring a related sub-topic or reset practice history."
 
     # Fallback path: curated built-in questions genuinely matching topic
     t_fb_start = time.time()
-    bank = _get_fallback_bank(subject, topic, level)
+    bank = _get_fallback_bank(subject, clean_topic, level)
     if not bank or len(bank) < 3:
-        LAST_DIAGNOSTIC_METRICS = {
+        logger.info(
+            "Diagnostic fallback lookup miss | subject=%s | topic=%s | reason=no_curated_bank_for_custom_topic",
+            subject, clean_topic
+        )
+        logger.warning(
+            "Diagnostic generation failed | topic=%s | subject=%s | stage=%s | category=%s | code=%s | raw_len=%d | elapsed=%.2fs | reason=%s",
+            clean_topic, subject, stage, error_category, status_code if status_code is not None else "none",
+            len(raw) if raw else 0, round(time.time() - t_total_start, 2), error_reason
+        )
+
+        category_label = error_category.replace("_", " ").title()
+        status_msg = (
+            f"[{category_label}] {error_reason} "
+            f"We couldn't prepare verified questions for this topic right now. Please try again. "
+            f"No offline fallback questions match this custom topic. "
+            f"{action_guidance}"
+        )
+        LAST_DIAGNOSTIC_METRICS.clear()
+        LAST_DIAGNOSTIC_METRICS.update({
             "syllabus_lookup_s": round(t_syl_elapsed, 6),
             "ai_generation_s": ai_elapsed,
             "fallback_lookup_s": round(time.time() - t_fb_start, 6),
             "total_elapsed_s": round(time.time() - t_total_start, 3),
             "source_used": "none",
             "question_count": 0,
-            "api_attempts": getattr(gemini, "last_metrics", {}).get("attempts", []) if gemini else [],
-            "model": getattr(gemini, "model", "gemini-3.8-flash") if gemini else "offline",
-            "timed_out": getattr(gemini, "last_metrics", {}).get("timeout_occurred", False) if gemini else False
-        }
-        return [], "We couldn't prepare verified questions for this topic right now. Please try again. No offline fallback questions match this custom topic. Please check your connection and try again in a few moments."
+            "api_attempts": api_attempts,
+            "model": model_name,
+            "timed_out": is_timeout,
+            "error_category": error_category,
+            "error_reason": error_reason,
+            "api_status_code": status_code,
+            "raw_length": len(raw) if raw else 0,
+            "fallback_matched": False
+        })
+        return [], status_msg
 
     fallback_questions = []
     fresh_bank = [item for item in bank if normalize_question_prompt(item["prompt"]) not in norm_previous]
@@ -715,7 +957,8 @@ RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
         status_note += f" · Core alignment: {syl['curriculum']}"
 
     gemini_metrics = getattr(gemini, "last_metrics", {}) if gemini else {}
-    LAST_DIAGNOSTIC_METRICS = {
+    LAST_DIAGNOSTIC_METRICS.clear()
+    LAST_DIAGNOSTIC_METRICS.update({
         "syllabus_lookup_s": round(t_syl_elapsed, 6),
         "ai_generation_s": ai_elapsed,
         "fallback_lookup_s": round(t_fb_elapsed, 6),
@@ -723,7 +966,10 @@ RETURN FORMAT: Return ONLY a valid JSON array of objects with keys:
         "source_used": "fallback",
         "question_count": len(final_fallback),
         "api_attempts": gemini_metrics.get("attempts", []),
-        "model": getattr(gemini, "model", "gemini-3.8-flash") if gemini else "offline",
-        "timed_out": gemini_metrics.get("timeout_occurred", False)
-    }
+        "model": getattr(gemini, "model", "gemini-3.5-flash-lite") if gemini else "offline",
+        "timed_out": gemini_metrics.get("timeout_occurred", False),
+        "error_category": error_category,
+        "error_reason": error_reason,
+        "fallback_matched": True
+    })
     return final_fallback, status_note

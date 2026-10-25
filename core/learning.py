@@ -29,8 +29,8 @@ def next_review_days(correct, streak=0):
     idx = max(0, min(int(streak), len(schedule) - 1))
     return schedule[idx]
 
-def build_practice_set(subject, topic, analysis=None, gemini=None):
-    """Generate 3 targeted practice questions addressing the student's identified gaps."""
+def build_practice_set(subject, topic, analysis=None, gemini=None, stage=None, curriculum=None, curriculum_context=None, custom_syllabus=""):
+    """Generate 3 targeted practice questions addressing the student's identified gaps, calibrated to their education stage."""
     mistakes = []
     if analysis and isinstance(analysis, dict):
         mistakes = analysis.get("mistakes", [])
@@ -40,7 +40,12 @@ def build_practice_set(subject, topic, analysis=None, gemini=None):
 
     # Attempt AI generation if Gemini is available
     if gemini and getattr(gemini, "available", lambda: False)():
-        prompt = f"""Create exactly 3 multiple-choice practice questions targeting the student's weak areas in:
+        from core.syllabus import build_curriculum_context
+        ctx = curriculum_context or build_curriculum_context(stage, curriculum, subject, topic, custom_syllabus=custom_syllabus)
+        prompt = f"""You are an educational assistant creating targeted practice questions.
+{ctx}
+
+Create exactly 3 multiple-choice practice questions targeting the student's weak areas in:
 Subject: {subject}
 Topic: {topic}
 Primary difficulty: {primary_mistake}
@@ -54,8 +59,21 @@ Return ONLY a valid JSON array of 3 objects with:
         raw, status = gemini.generate_text(prompt, max_output_tokens=900)
         if raw:
             try:
-                match = re.search(r"\[.*\]", raw, re.S)
-                items = json.loads(match.group(0) if match else raw)
+                clean = raw.strip()
+                fence_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", clean, re.DOTALL | re.IGNORECASE)
+                cand_str = fence_match.group(1) if fence_match else clean
+
+                start_b = cand_str.find("[")
+                end_b = cand_str.rfind("]")
+                if start_b != -1 and end_b > start_b:
+                    cand_str = cand_str[start_b:end_b + 1]
+
+                from agents.gap_finder import _sanitize_json_escapes
+                try:
+                    items = json.loads(cand_str, strict=False)
+                except Exception:
+                    items = json.loads(_sanitize_json_escapes(cand_str), strict=False)
+
                 valid = []
                 for item in items:
                     if (

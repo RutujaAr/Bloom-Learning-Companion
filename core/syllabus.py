@@ -139,13 +139,51 @@ CBSE_SYLLABUS = {
     }
 }
 
-def get_supported_curricula():
+def get_supported_curricula(stage=None):
+    """
+    Return appropriate curricula choices based on the learner's education stage.
+    Ensures College/University students are not defaulted to school boards like CBSE.
+    """
+    if stage == "College":
+        return [
+            "University / Degree Curriculum",
+            "College Course Outline",
+            "Autonomous / State University Syllabus",
+            "Technical / Professional Programme",
+            "Custom Syllabus (Learner-Supplied)"
+        ]
+    elif stage == "Research / PhD":
+        return [
+            "Postgraduate / Research Programme",
+            "Specialized Academic Literature",
+            "Custom Research Focus"
+        ]
+    elif stage == "Class 12":
+        return [
+            "CBSE (Reference Syllabus)",
+            "ISC (CISCE Curriculum)",
+            "State Board Syllabus",
+            "Cambridge (A-Levels)",
+            "Custom Syllabus (Learner-Supplied)"
+        ]
+    elif stage == "Class 10":
+        return [
+            "CBSE (Reference Syllabus)",
+            "ICSE (CISCE Curriculum)",
+            "State Board Syllabus",
+            "Cambridge (IGCSE)",
+            "Custom Syllabus (Learner-Supplied)"
+        ]
+    # Default list when stage is unspecified (preserves backwards-compatibility with legacy references)
     return [
+        "University / Degree Curriculum",
+        "College / University Outline",
+        "CBSE (Reference Syllabus)",
         "CBSE (Verified 2024-25)",
         "ICSE / ISC (CISCE 2024-25)",
-        "Cambridge (IGCSE / A-Levels)",
         "State Board / Standard Curriculum",
-        "College / University Outline",
+        "Cambridge (IGCSE / A-Levels)",
+        "Custom Syllabus (Learner-Supplied)",
         "Other / General"
     ]
 
@@ -184,24 +222,96 @@ def get_syllabus_context(stage, curriculum_name, subject, topic):
         meta = CURRICULA_METADATA["CBSE"]
         return {
             "verified": True,
-            "curriculum": f"CBSE {stage} (Session {meta['academic_year']})",
+            "curriculum": f"CBSE {stage} (Reference Curriculum)",
             "source": f"Official Portal {meta['source']}",
             "unit": matched_unit,
             "chapters": ", ".join(matched_details.get("chapters", [])),
             "outcomes": "; ".join(matched_details.get("outcomes", [])),
             "exam_style": matched_details.get("exam_style", "Conceptual application and multi-step calculation"),
-            "disclaimer": f"Aligned with official CBSE {stage} {meta['academic_year']} curriculum published on {meta['source']}."
+            "disclaimer": f"Aligned with official CBSE {stage} reference syllabus published on {meta['source']}."
         }
 
-    # If unverified or outside curated CBSE index
-    is_custom = "Other" in str(curriculum_name) or "College" in str(stage) or "Research" in str(stage)
+    # If unverified, higher education, or outside curated CBSE index
+    default_curr = "University / Degree Curriculum" if stage == "College" else "Standard Educational Framework"
+    active_curr = curriculum_name or default_curr
     return {
         "verified": False,
-        "curriculum": curriculum_name or "Standard Educational Framework",
-        "source": "Learner-provided syllabus topic",
+        "curriculum": active_curr,
+        "source": "Learner-selected / Standard Academic Outline",
         "unit": topic,
         "chapters": topic,
         "outcomes": f"Core principles, problem-solving, and applications of {topic}",
         "exam_style": "Exam-style application, conceptual reasoning, and worked problem-solving",
-        "disclaimer": "No verified board syllabus cache found for this specific subject/topic. Questions are generated from core academic principles for this stage."
+        "disclaimer": f"No verified board syllabus cache found for this specific subject/topic. Questions and explanations follow core academic principles for {stage or 'Learner'}."
     }
+
+
+def build_curriculum_context(stage, curriculum, subject="", topic="", custom_syllabus=""):
+    """
+    Single reliable curriculum and education stage context builder for AI generation prompts
+    across Bloom (diagnostic gaps, textbook helper, recall & revision, personal study guide).
+    Genuinely personalizes terminology, analytical depth, problem-solving methods, and syllabus scope.
+    """
+    s_stage = (stage or "College").strip()
+    s_curr = (curriculum or ("University / Degree Curriculum" if s_stage == "College" else "Standard Educational Framework")).strip()
+    c_syl = (custom_syllabus or "").strip()
+
+    # Stage-specific pedagogical directives
+    if s_stage == "Class 10":
+        pedagogy = (
+            "PEDAGOGICAL LEVEL & TERMINOLOGY DIRECTIVES (Class 10 / Secondary Level - Ages 15-16):\n"
+            "- Terminology: Use clear, age-appropriate, foundational academic terms. Avoid advanced calculus, post-secondary abstraction, or graduate research jargon.\n"
+            "- Explanations: Concrete everyday analogies, clear intuitive models, and step-by-step arithmetic/algebraic steps.\n"
+            "- Scope & Style: Adhere strictly to secondary school board curriculum standards and foundational definitions."
+        )
+    elif s_stage == "Class 12":
+        pedagogy = (
+            "PEDAGOGICAL LEVEL & TERMINOLOGY DIRECTIVES (Class 12 / Senior Secondary - Ages 17-18):\n"
+            "- Terminology: Use formal senior-secondary terminology, standard physical/mathematical derivations, chemical reaction mechanisms, and symbolic proofs.\n"
+            "- Explanations: Deep analytical reasoning, rigorous multi-step problem solving, and standard pre-university exam rigor.\n"
+            "- Scope & Style: Target senior-secondary / entrance exam benchmarks without oversimplification."
+        )
+    elif s_stage == "Research / PhD":
+        pedagogy = (
+            "PEDAGOGICAL LEVEL & TERMINOLOGY DIRECTIVES (Research / PhD Level - Doctoral Study):\n"
+            "- Terminology: Specialist domain vocabulary, state-of-the-art methodology, theoretical bounds, and formal notation.\n"
+            "- Explanations: Advanced critical evaluation, comparative paradigms, open problems, and algorithmic/theoretical trade-offs.\n"
+            "- Scope & Style: Maintain doctoral rigour without hallucinating or inventing fabricated research citations or DOIs."
+        )
+    else:  # College / Undergraduate
+        pedagogy = (
+            "PEDAGOGICAL LEVEL & TERMINOLOGY DIRECTIVES (College / Undergraduate Level):\n"
+            "- Terminology: Formal university academic terminology, algorithmic complexity, architectural design patterns, and formal proofs.\n"
+            "- Explanations: Undergraduate depth, system-level trade-offs, formal implementations, and worked engineering/scientific problem solving.\n"
+            "- Scope & Style: University degree syllabus standards bridging fundamentals to practical application."
+        )
+
+    syl = get_syllabus_context(s_stage, s_curr, subject or "General", topic or "Core Concepts")
+    custom_clause = f"\nUser-Supplied Course/Syllabus Outline: {c_syl}" if c_syl else ""
+
+    # Defensive check: if contradictory stage & board (e.g. College + CBSE), explicitly enforce stage
+    conflict_note = ""
+    if s_stage in ("College", "Research / PhD") and "CBSE" in s_curr:
+        conflict_note = f"\nNote: Learner stage is {s_stage}; calibrate terminology and depth to {s_stage} level despite school board framework reference."
+
+    if syl.get("verified"):
+        return (
+            f"ACADEMIC PROFILE & CURRICULUM CONTEXT:\n"
+            f"Education Stage: {s_stage}\n"
+            f"Curriculum Framework: {syl['curriculum']}\n"
+            f"Syllabus Source: {syl['source']}\n"
+            f"Syllabus Unit/Chapters: {syl.get('chapters') or syl.get('unit')}\n"
+            f"Target Outcomes: {syl.get('outcomes')}\n"
+            f"Expected Rigor: {syl.get('exam_style')}{custom_clause}{conflict_note}\n\n"
+            f"{pedagogy}"
+        )
+    else:
+        topic_clause = f" on {topic}" if topic else ""
+        return (
+            f"ACADEMIC PROFILE & CURRICULUM CONTEXT:\n"
+            f"Education Stage: {s_stage}\n"
+            f"Curriculum Framework: {syl['curriculum']}\n"
+            f"Syllabus Grounding: {syl.get('source', 'Learner-selected outline')}\n"
+            f"Subject & Topic: {subject or 'General'}{topic_clause}{custom_clause}{conflict_note}\n\n"
+            f"{pedagogy}"
+        )

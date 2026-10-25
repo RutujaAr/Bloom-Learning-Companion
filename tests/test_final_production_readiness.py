@@ -157,24 +157,24 @@ def test_unknown_topic_question_generation_without_redundant_cache_search():
 # 7: Model IDs and raw exceptions never appear in learner output
 # ---------------------------------------------------------------------------
 def test_model_ids_and_raw_exceptions_sanitized(monkeypatch):
-    service = GeminiService(model="gemini-3.8-flash")
+    service = GeminiService(model="gemini-3.5-flash-lite")
     service.api_key = "dummy-key"
 
     class FailingClient:
         class models:
             @staticmethod
             def generate_content(*args, **kwargs):
-                raise RuntimeError("Internal 504 Deadline Exceeded: upstream cluster failure at /v1/models/gemini-3.8-flash")
+                raise RuntimeError("Internal 504 Deadline Exceeded: upstream cluster failure at /v1/models/gemini-3.5-flash-lite")
 
     import google.genai
     monkeypatch.setattr(google.genai, "Client", lambda **kwargs: FailingClient())
 
     ans, status = service.explain_from_document("What is ATP?", "ATP is energy.")
     assert ans is not None
-    assert "gemini-3.8-flash" not in ans
+    assert "gemini-3.5-flash-lite" not in ans
     assert "504" not in ans
     assert "upstream cluster" not in ans
-    assert "gemini-3.8-flash" not in status
+    assert "gemini-3.5-flash-lite" not in status
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +362,50 @@ def test_duplicate_submission_handling(isolated_db):
     upcoming_reviews = db.get_upcoming_reviews(sid, limit=10)
     total_active = len([r for r in due_reviews + upcoming_reviews if r["topic"] == "Equilibrium"])
     assert total_active == 1
+
+
+def test_diagnostic_assessment_already_recorded_prevents_duplicate_db_records(isolated_db):
+    student = db.get_or_create_account(owner_id="owner_diag_record_test", display_name="Diag Record Tester")
+    sid = student["id"]
+
+    diagnostic_questions = [
+        {"id": "q1", "prompt": "Prompt 1", "options": ["A", "B"], "answer": "A", "mistake_type": "conceptual"},
+        {"id": "q2", "prompt": "Prompt 2", "options": ["C", "D"], "answer": "C", "mistake_type": "calculation"},
+    ]
+    answers = {"q1": "A", "q2": "C"}
+
+    session_state = {"diagnostic_submitted": False}
+
+    def simulate_submit(state, answers_dict):
+        if state.get("diagnostic_submitted"):
+            return "already_submitted"
+        unanswered = [i for i, q in enumerate(diagnostic_questions, 1) if answers_dict.get(q["id"]) is None]
+        if unanswered:
+            return "unanswered"
+        state["diagnostic_submitted"] = True
+        results = []
+        for q in diagnostic_questions:
+            ans = answers_dict.get(q["id"], "")
+            is_corr = (str(ans).strip().lower() == str(q["answer"]).strip().lower())
+            results.append({"question": q, "answer": ans, "correct": is_corr})
+            db.save_attempt(sid, "Science", "Cells", q["prompt"], ans, q["answer"], is_corr, q["mistake_type"], mode="diagnostic")
+        state["diagnostic_result"] = {"results": results, "score": 100}
+        return "recorded"
+
+    # First submission records attempts
+    res1 = simulate_submit(session_state, answers)
+    assert res1 == "recorded"
+    assert session_state["diagnostic_submitted"] is True
+    assert len(session_state["diagnostic_result"]["results"]) == 2
+    attempts_1 = db.get_attempts(sid)
+    assert len(attempts_1) == 2
+
+    # Second submission when already recorded must NOT duplicate database records or throw NameError
+    res2 = simulate_submit(session_state, answers)
+    assert res2 == "already_submitted"
+    attempts_2 = db.get_attempts(sid)
+    assert len(attempts_2) == 2, "Attempts count must remain 2, no duplicates created"
+
 
 
 # ---------------------------------------------------------------------------
